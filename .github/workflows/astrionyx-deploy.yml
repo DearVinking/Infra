@@ -1,0 +1,143 @@
+name: Astrionyx 后端部署
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 要部署的提交 SHA / 分支 / tag（留空为 main）
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: astrionyx-deploy
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: DearVinking/Astrionyx
+  SOURCE_ENVIRONMENT: production
+
+jobs:
+  deploy:
+    name: 构建并部署后端
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: astrionyx
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 解析提交并登记部署
+        id: deployment
+        env:
+          GH_TOKEN: ${{ secrets.CI_TOKEN }}
+          REF: ${{ inputs.ref || 'main' }}
+        run: |
+          set -euo pipefail
+          sha="$(scripts/deployment.sh resolve "$SOURCE_REPOSITORY" "$REF")"
+          id="$(scripts/deployment.sh create "$SOURCE_REPOSITORY" "$SOURCE_ENVIRONMENT" "$sha")"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "部署 ${sha:0:7}（deployment #$id）"
+
+      - name: 检查 secrets
+        env:
+          CI_TOKEN: ${{ secrets.CI_TOKEN }}
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          ACR_NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
+          ACR_REPO: ${{ secrets.ACR_REPO }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          HOST: ${{ secrets.HOST }}
+          USER: ${{ secrets.USER }}
+          KEY: ${{ secrets.KEY }}
+          PORT: ${{ secrets.PORT }}
+        run: |
+          missing=()
+          for name in CI_TOKEN ACR_REGISTRY ACR_NAMESPACE ACR_REPO ACR_USERNAME ACR_PASSWORD HOST USER KEY PORT; do
+            [[ -n "${!name:-}" ]] || missing+=("$name")
+          done
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::缺少配置（environment astrionyx）: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: 检出 Astrionyx
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ steps.deployment.outputs.sha }}
+          token: ${{ secrets.CI_TOKEN }}
+          path: src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 设置 Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: src/apps/api/go.mod
+          cache-dependency-path: src/apps/api/go.sum
+
+      - name: 后端测试与漏洞扫描
+        working-directory: src/apps/api
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/scripts/quiet.sh" go-vet go vet ./...
+          "$GITHUB_WORKSPACE/scripts/quiet.sh" go-test go test ./...
+          "$GITHUB_WORKSPACE/scripts/quiet.sh" govulncheck go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: 登录阿里云容器镜像服务
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ secrets.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: 构建并推送 Docker 镜像
+        env:
+          IMAGE: ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/${{ secrets.ACR_REPO }}
+          TAG: sha-${{ steps.deployment.outputs.sha }}
+        run: |
+          scripts/quiet.sh docker-build docker buildx build \
+            --file src/apps/api/Dockerfile \
+            --push \
+            --tag "$IMAGE:$TAG" \
+            --tag "$IMAGE:latest" \
+            --cache-from "type=registry,ref=$IMAGE:latest" \
+            --cache-to type=inline \
+            --provenance=false \
+            --sbom=false \
+            --progress=plain \
+            src/apps/api
+
+      - name: SSH 部署后端
+        env:
+          SSH_HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.PORT }}
+          SSH_USER: ${{ secrets.USER }}
+          SSH_KEY: ${{ secrets.KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_TIMEOUT: "300"
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          API_IMAGE: ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/${{ secrets.ACR_REPO }}:sha-${{ steps.deployment.outputs.sha }}
+        run: >-
+          scripts/quiet.sh ssh-deploy scripts/ssh-deploy.sh scripts/remote/astrionyx.sh
+          ACR_REGISTRY ACR_USERNAME ACR_PASSWORD API_IMAGE
+
+      - name: 更新部署状态
+        if: always() && steps.deployment.outputs.id != ''
+        env:
+          GH_TOKEN: ${{ secrets.CI_TOKEN }}
+          DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
+          STATE: ${{ job.status == 'success' && 'success' || 'failure' }}
+        run: scripts/deployment.sh status "$SOURCE_REPOSITORY" "$DEPLOYMENT_ID" "$STATE"

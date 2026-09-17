@@ -1,0 +1,168 @@
+name: Daymark 签到
+
+on:
+  schedule:
+    - cron: "36 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daymark-checkin
+  cancel-in-progress: false
+
+env:
+  STATE_BUNDLE: daymark-state.tar.gz.enc
+
+jobs:
+  checkin:
+    name: 执行签到
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: daymark
+    defaults:
+      run:
+        working-directory: src
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUNBUFFERED: 1
+      QUIET: ${{ github.workspace }}/scripts/quiet.sh
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 检查 secrets
+        working-directory: ${{ github.workspace }}
+        env:
+          CI_TOKEN: ${{ secrets.CI_TOKEN }}
+          SOURCE_REPOSITORY: ${{ secrets.SOURCE_REPOSITORY }}
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
+          ENCRYPTION_PASSPHRASE: ${{ secrets.ENCRYPTION_PASSPHRASE }}
+        run: |
+          missing=()
+          for name in CI_TOKEN SOURCE_REPOSITORY ACCOUNTS ENCRYPTION_PASSPHRASE; do
+            [[ -n "${!name:-}" ]] || missing+=("$name")
+          done
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::缺少配置（environment daymark）: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: 检出签到仓库
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ secrets.SOURCE_REPOSITORY }}
+          token: ${{ secrets.CI_TOKEN }}
+          path: src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 设置 uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: latest
+          cache-dependency-glob: src/uv.lock
+
+      - name: 设置 Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: $QUIET uv-sync uv sync --frozen
+
+      - name: 安装系统依赖
+        run: |
+          $QUIET apt-update sudo apt-get update
+          $QUIET apt-install sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
+            fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf
+
+      - name: 缓存 CloakBrowser 二进制
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cloakbrowser
+          key: ${{ runner.os }}-cloakbrowser-v1
+          restore-keys: |
+            ${{ runner.os }}-cloakbrowser-
+
+      - name: 安装 CloakBrowser
+        run: $QUIET cloakbrowser-install uv run python -m cloakbrowser install
+
+      - name: 恢复加密状态缓存
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/${{ env.STATE_BUNDLE }}
+          key: daymark-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            daymark-state-
+
+      - name: 解密状态
+        env:
+          PASSPHRASE: ${{ secrets.ENCRYPTION_PASSPHRASE }}
+        run: |
+          bundle="$RUNNER_TEMP/$STATE_BUNDLE"
+          if [[ ! -f "$bundle" ]]; then
+            echo "没有可恢复的状态，首次运行"
+            exit 0
+          fi
+          if openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:PASSPHRASE -in "$bundle" | tar -xzf -; then
+            echo "已恢复状态"
+          else
+            echo "::warning::状态缓存解密失败，按首次运行处理"
+            rm -rf balance_hash.txt .browser_profiles
+          fi
+
+      - name: 配置代理
+        env:
+          PROXY_SUBSCRIPTION_URL: ${{ secrets.PROXY_SUBSCRIPTION_URL }}
+          PROXY_TEST_URL: https://www.google.com/generate_204
+          MIHOMO_VERSION: v1.19.27
+          PROXY_REQUIRED: false
+        run: $QUIET proxy-setup bash scripts/setup_mihomo_proxy.sh
+
+      - name: 执行签到
+        env:
+          CHECKIN_HEADLESS: false
+          CHECKIN_HUMANIZE: true
+          CHECKIN_WAIT_TIMEOUT_MS: 120000
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
+          PROVIDERS: ${{ secrets.PROVIDERS }}
+          CUSTOM_WEBHOOK_URL: ${{ secrets.CUSTOM_WEBHOOK_URL }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          CUSTOM_WEBHOOK_METHOD: ${{ secrets.CUSTOM_WEBHOOK_METHOD }}
+          CUSTOM_WEBHOOK_HEADERS: ${{ secrets.CUSTOM_WEBHOOK_HEADERS }}
+          CUSTOM_WEBHOOK_BODY_TEMPLATE: ${{ secrets.CUSTOM_WEBHOOK_BODY_TEMPLATE }}
+        run: $QUIET checkin xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run checkin.py
+
+      - name: 停止代理
+        if: always()
+        run: $QUIET proxy-stop bash scripts/stop_mihomo_proxy.sh
+
+      - name: 加密状态
+        if: always()
+        id: encrypt-state
+        env:
+          PASSPHRASE: ${{ secrets.ENCRYPTION_PASSPHRASE }}
+        run: |
+          paths=()
+          [[ -f balance_hash.txt ]] && paths+=(balance_hash.txt)
+          [[ -d .browser_profiles ]] && paths+=(.browser_profiles)
+          if [[ ${#paths[@]} -eq 0 ]]; then
+            echo "没有需要保存的状态"
+            exit 0
+          fi
+          bundle="$RUNNER_TEMP/$STATE_BUNDLE"
+          tar -czf - "${paths[@]}" \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:PASSPHRASE -out "$bundle"
+          echo "bundle=$bundle" >> "$GITHUB_OUTPUT"
+          echo "已加密 ${paths[*]}"
+
+      - name: 保存加密状态缓存
+        if: always() && steps.encrypt-state.outputs.bundle != ''
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ steps.encrypt-state.outputs.bundle }}
+          key: daymark-state-${{ github.run_id }}-${{ github.run_attempt }}

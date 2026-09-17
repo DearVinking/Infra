@@ -1,0 +1,63 @@
+name: Yohaku 同步上游
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yohaku-sync-upstream
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: DearVinking/Yohaku
+  SOURCE_BRANCH: main
+  UPSTREAM_REPOSITORY: innei-dev/yohaku
+  UPSTREAM_BRANCH: main
+  DEPLOY_WORKFLOW: yohaku-deploy.yml
+  DEPLOY_EXCLUDE_PATTERNS: "*.md docs/* .github/scripts/*"
+
+jobs:
+  sync:
+    name: 合并上游变更
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: yohaku
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 检查 secrets
+        env:
+          CI_TOKEN: ${{ secrets.CI_TOKEN }}
+        run: |
+          if [[ -z "$CI_TOKEN" ]]; then
+            echo "::error::缺少配置: CI_TOKEN"
+            exit 1
+          fi
+
+      - name: 检出 Yohaku
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_BRANCH }}
+          token: ${{ secrets.CI_TOKEN }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 合并并推送
+        env:
+          CI_TOKEN: ${{ secrets.CI_TOKEN }}
+          UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: scripts/sync-upstream.sh
