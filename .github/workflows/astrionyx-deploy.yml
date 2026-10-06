@@ -26,6 +26,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: astrionyx
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: 检出本仓库
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -85,11 +99,33 @@ jobs:
 
       - name: 后端测试与漏洞扫描
         working-directory: src/apps/api
+        env:
+          AST_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
         run: |
           set -euo pipefail
           "$GITHUB_WORKSPACE/scripts/quiet.sh" go-vet go vet ./...
           "$GITHUB_WORKSPACE/scripts/quiet.sh" go-test go test ./...
           "$GITHUB_WORKSPACE/scripts/quiet.sh" govulncheck go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+      - name: 部署与数据库权限回归测试
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: |
+          set -euo pipefail
+          scripts/quiet.sh deploy-test node --test scripts/remote/astrionyx.test.mjs
+          # 手动部署旧提交时，源码可能尚未包含该维护脚本。
+          if [[ -f src/script/test-db-ownership.sh ]]; then
+            if ! command -v psql >/dev/null; then
+              sudo apt-get update
+              sudo apt-get install -y postgresql-client
+            fi
+            scripts/quiet.sh ownership-test sh src/script/test-db-ownership.sh
+          else
+            echo "当前源码版本未包含所有权回归脚本，跳过该项检查"
+          fi
 
       - name: 设置 Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -125,7 +161,7 @@ jobs:
           SSH_USER: ${{ secrets.USER }}
           SSH_KEY: ${{ secrets.KEY }}
           SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
-          SSH_TIMEOUT: "300"
+          SSH_TIMEOUT: "600"
           ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
