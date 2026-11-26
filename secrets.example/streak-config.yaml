@@ -1,0 +1,14 @@
+log_level: info
+random_sleep_secs: 60
+
+notification: {}
+
+users:
+  - name: 账号1
+    kuro:
+      token: KURO_TOKEN
+    skland:
+      token: SKLAND_TOKEN
+    tajiduo:
+      token: SDK_TOKEN
+      user_identity: "SDK_USER_ID"

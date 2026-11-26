@@ -1,0 +1,33 @@
+diff --git a/channel/wechat-corp-account.go b/channel/wechat-corp-account.go
+index 0bd3313..1d149a8 100644
+--- a/channel/wechat-corp-account.go
++++ b/channel/wechat-corp-account.go
+@@ -89,9 +89,6 @@ type wechatCorpMessageRequest struct {
+ 	Text struct {
+ 		Content string `json:"content"`
+ 	} `json:"text"`
+-	Markdown struct {
+-		Content string `json:"content"`
+-	} `json:"markdown"`
+ }
+ 
+ type wechatCorpMessageResponse struct {
+@@ -140,8 +137,8 @@ func SendWeChatCorpMessage(message *model.Message, user *model.User, channel_ *m
+ 			messageRequest.TextCard.Description = message.Description
+ 			messageRequest.TextCard.URL = message.URL
+ 		} else {
+-			messageRequest.MessageType = "markdown"
+-			messageRequest.Markdown.Content = message.Content
++			messageRequest.MessageType = "text"
++			messageRequest.Text.Content = message.Content
+ 		}
+ 	}
+ 	jsonData, err := json.Marshal(messageRequest)
+@@ -155,6 +152,7 @@ func SendWeChatCorpMessage(message *model.Message, user *model.User, channel_ *m
+ 	if err != nil {
+ 		return err
+ 	}
++	defer resp.Body.Close()
+ 	var res wechatCorpMessageResponse
+ 	err = json.NewDecoder(resp.Body).Decode(&res)
+ 	if err != nil {
