@@ -115,7 +115,7 @@ jobs:
           retention-days: 7
 
   web_tests:
-    name: Web test coverage
+    name: Web quality and coverage
     if: needs.prepare.outputs.run == 'true'
     needs: prepare
     runs-on: ubuntu-latest
@@ -151,11 +151,23 @@ jobs:
           cache: false
 
       - *setup-node
+      - &setup-go
+        name: 设置 Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: ${{ steps.tools.outputs.go }}
+          cache: false
 
       - &install-node
         name: 安装依赖
         run: |
           "$QUIET" install pnpm install --frozen-lockfile
+
+      - name: 检查 Web 代码、类型、配置及依赖边界
+        run: '"$QUIET" lint-web pnpm lint:web'
+
+      - name: 验证 Go 分组报告
+        run: '"$QUIET" go-report-test node --test "$GITHUB_WORKSPACE/tests/go-test-groups.test.mjs"'
 
       - name: 生成 Web 覆盖率
         run: |
@@ -182,41 +194,6 @@ jobs:
           overwrite: true
           retention-days: 7
 
-  quality:
-    name: Code quality
-    if: needs.prepare.outputs.run == 'true'
-    # 分批申请 macOS runner，避免等待任务因容量不足被取消。
-    needs: [prepare, desktop_macos_go]
-    runs-on: macos-26
-    timeout-minutes: 90
-    environment: astrionyx
-    defaults: *source-run
-    env:
-      REPORT_NAME: quality
-      REPORT_PATHS: ""
-    steps:
-      - *checkout-infra
-      - *checkout-source
-      - &select-xcode
-        name: 选择 Xcode 26.5
-        run: sudo xcode-select -s /Applications/Xcode_26.5.app
-      - *setup-pnpm
-      - *setup-node
-      - &setup-go
-        name: 设置 Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
-        with:
-          go-version: ${{ steps.tools.outputs.go }}
-          cache: false
-      - *install-node
-      - name: 检查代码、类型、配置及依赖边界
-        run: |
-          set -euo pipefail
-          "$QUIET" lint-web pnpm lint:web
-          "$QUIET" lint-go pnpm lint:go
-      - *seal-reports
-      - *upload-reports
-
   go_tests:
     name: Go test coverage (${{ matrix.group }})
     if: needs.prepare.outputs.run == 'true'
@@ -231,7 +208,7 @@ jobs:
         group: [large_import, remaining]
     env:
       REPORT_NAME: go_tests-${{ matrix.group }}
-      REPORT_PATHS: ${{ matrix.group == 'remaining' && 'apps/api/coverage.out apps/api/coverage-shared.out apps/api/coverage-desktop.out coverage/go-tests' || 'apps/api/coverage-desktop.out coverage/go-tests' }}
+      REPORT_PATHS: ${{ matrix.group == 'remaining' && 'apps/api/coverage.out apps/api/coverage-shared.out coverage/go-tests' || 'coverage/go-tests' }}
       SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
       GO_TEST_GROUP: ${{ matrix.group }}
     services:
@@ -305,11 +282,15 @@ jobs:
     steps:
       - *checkout-infra
       - *checkout-source
-      - *select-xcode
+      - &select-xcode
+        name: 选择 Xcode 26.5
+        run: sudo xcode-select -s /Applications/Xcode_26.5.app
       - *setup-pnpm
       - *setup-node
       - *setup-go
       - *install-node
+      - name: 检查 Go 代码和依赖漏洞
+        run: '"$QUIET" lint-go pnpm lint:go'
       - name: 构建并校验 macOS 宿主
         run: |
           "$QUIET" desktop-check pnpm desktop:macos check
@@ -330,32 +311,29 @@ jobs:
       - *upload-reports
 
   desktop_macos_go:
-    name: macOS Go race (${{ matrix.group }})
+    name: macOS Go race
     if: needs.prepare.outputs.run == 'true'
     needs: [prepare, desktop_macos]
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 180
     environment: astrionyx
     defaults: *source-run
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        group: [large_import, remaining]
     env:
-      REPORT_NAME: desktop_macos_go-${{ matrix.group }}
-      REPORT_PATHS: apps/api/coverage-desktop.out coverage/go-tests
+      REPORT_NAME: desktop_macos_go
+      REPORT_PATHS: coverage/go-tests
       SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
-      GO_TEST_GROUP: ${{ matrix.group }}
     steps:
       - *checkout-infra
       - *checkout-source
       - *select-xcode
       - *setup-node
       - *setup-go
-      - name: 检查桌面 Go race
-        run: |
-          "$QUIET" desktop-race node "$GITHUB_WORKSPACE/scripts/go-test-groups.mjs" run "$GO_TEST_GROUP"
+      - name: 检查桌面 Go race（大文件导入）
+        id: large_import
+        run: '"$QUIET" desktop-race-large node "$GITHUB_WORKSPACE/scripts/go-test-groups.mjs" run large_import'
+      - name: 检查桌面 Go race（其余用例）
+        if: ${{ !cancelled() && (steps.large_import.outcome == 'success' || steps.large_import.outcome == 'failure') }}
+        run: '"$QUIET" desktop-race-remaining node "$GITHUB_WORKSPACE/scripts/go-test-groups.mjs" run remaining'
       - *seal-reports
       - *upload-reports
 
@@ -436,7 +414,6 @@ jobs:
       [
         prepare,
         web_tests,
-        quality,
         go_tests,
         desktop_macos,
         desktop_macos_go,
@@ -470,9 +447,8 @@ jobs:
       - name: 下载 macOS Go 检查报告
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          pattern: ci-desktop_macos_go-*
+          name: ci-desktop_macos_go
           path: ${{ runner.temp }}/ci-macos-go-download
-          merge-multiple: true
       - name: 合并 Go 测试清单与覆盖率
         working-directory: ${{ github.workspace }}
         env:
@@ -480,20 +456,17 @@ jobs:
           SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           "$QUIET" go-reports bash -euo pipefail -c '
+            mkdir -p "$RUNNER_TEMP/go-reports" "$RUNNER_TEMP/go-macos-reports"
             for group in large_import remaining; do
-              mkdir -p "$RUNNER_TEMP/go-reports/$group"
               node scripts/ci-artifacts.mjs open "$RUNNER_TEMP/ci-go-download/go_tests-$group.enc" "$RUNNER_TEMP/go-reports/$group.tar.gz"
-              tar -xzf "$RUNNER_TEMP/go-reports/$group.tar.gz" -C "$RUNNER_TEMP/go-reports/$group" apps/api/coverage-desktop.out coverage/go-tests
+              tar -xzf "$RUNNER_TEMP/go-reports/$group.tar.gz" -C "$RUNNER_TEMP/go-reports" "coverage/go-tests/$group"
             done
-            for group in large_import remaining; do
-              mkdir -p "$RUNNER_TEMP/go-macos-reports/$group"
-              node scripts/ci-artifacts.mjs open "$RUNNER_TEMP/ci-macos-go-download/desktop_macos_go-$group.enc" "$RUNNER_TEMP/go-macos-reports/$group.tar.gz"
-              tar -xzf "$RUNNER_TEMP/go-macos-reports/$group.tar.gz" -C "$RUNNER_TEMP/go-macos-reports/$group" apps/api/coverage-desktop.out coverage/go-tests
-            done
-            env GITHUB_WORKSPACE="$RUNNER_TEMP/go-macos-merge" node scripts/go-test-groups.mjs merge "$RUNNER_TEMP/go-macos-reports"
+            node scripts/ci-artifacts.mjs open "$RUNNER_TEMP/ci-macos-go-download/desktop_macos_go.enc" "$RUNNER_TEMP/go-macos-reports/reports.tar.gz"
+            tar -xzf "$RUNNER_TEMP/go-macos-reports/reports.tar.gz" -C "$RUNNER_TEMP/go-macos-reports" coverage/go-tests
+            env GITHUB_WORKSPACE="$RUNNER_TEMP/go-macos-merge" node scripts/go-test-groups.mjs merge "$RUNNER_TEMP/go-macos-reports/coverage/go-tests"
             mkdir -p src/apps/api
             tar -xzf "$RUNNER_TEMP/go-reports/remaining.tar.gz" -C src apps/api/coverage.out apps/api/coverage-shared.out
-            node scripts/go-test-groups.mjs merge "$RUNNER_TEMP/go-reports"
+            node scripts/go-test-groups.mjs merge "$RUNNER_TEMP/go-reports/coverage/go-tests"
           '
       # SonarCloud 检查暂时停用。
       # - name: 检出固定提交及历史
@@ -529,7 +502,7 @@ jobs:
       #       done
       #       tar -xzf "$RUNNER_TEMP/web_tests.tar.gz" -C src coverage/lcov.info
       #       tar -xzf "$RUNNER_TEMP/go-reports/remaining.tar.gz" -C src apps/api/coverage.out apps/api/coverage-shared.out
-      #       node scripts/go-test-groups.mjs merge "$RUNNER_TEMP/go-reports"
+      #       node scripts/go-test-groups.mjs merge "$RUNNER_TEMP/go-reports/coverage/go-tests"
       #       tar -xzf "$RUNNER_TEMP/desktop_macos.tar.gz" -C src coverage/macos/coverage.xml coverage/macos/swiftlint.json
       #     '
       # - name: 校验 Sonar 项目配置
@@ -939,7 +912,6 @@ jobs:
       ${{ always() && !cancelled() && needs.prepare.result == 'success' &&
         ((needs.prepare.outputs.run == 'false' &&
           needs.web_tests.result == 'skipped' &&
-          needs.quality.result == 'skipped' &&
           needs.go_tests.result == 'skipped' &&
           needs.desktop_macos.result == 'skipped' &&
           needs.desktop_macos_go.result == 'skipped' &&
@@ -950,7 +922,6 @@ jobs:
           needs.release.result == 'skipped' && needs.deploy.result == 'skipped') ||
          (needs.prepare.outputs.run == 'true' &&
           needs.web_tests.result == 'success' &&
-          needs.quality.result == 'success' &&
           needs.go_tests.result == 'success' &&
           needs.desktop_macos.result == 'success' &&
           needs.desktop_macos_go.result == 'success' &&
@@ -966,7 +937,6 @@ jobs:
       [
         prepare,
         web_tests,
-        quality,
         go_tests,
         desktop_macos,
         desktop_macos_go,

@@ -4,7 +4,6 @@ import { assertCIResults, executionRepository } from "./source-ci.mjs";
 
 const checkJobs = [
   "web_tests",
-  "quality",
   "go_tests",
   "desktop_macos",
   "desktop_macos_go",

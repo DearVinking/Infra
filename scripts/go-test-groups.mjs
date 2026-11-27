@@ -9,8 +9,7 @@ import { pathToFileURL } from "node:url";
 const groups = ["large_import", "remaining"];
 const historical = "TestFullJSONImportBeyondHistoricalLimits";
 const profilePath = "apps/api/coverage-desktop.out";
-const manifestPath = "coverage/go-tests/manifest.json";
-const metadataPath = "coverage/go-tests/metadata.out";
+const reportsPath = "coverage/go-tests";
 const parameters = {
   count: 1,
   coverMode: "atomic",
@@ -210,11 +209,11 @@ export async function runGroup({ group, root, sha }) {
   checkContext(root, sha);
   assert.ok(groups.includes(group), "Invalid test group.");
   const module = join(root, "apps/desktop/core");
-  const output = join(root, profilePath);
-  const metadata = join(root, metadataPath);
-  const manifest = join(root, manifestPath);
-  mkdirSync(dirname(output), { recursive: true });
-  mkdirSync(dirname(manifest), { mode: 0o700, recursive: true });
+  const directory = join(root, reportsPath, group);
+  const output = join(directory, "coverage.out");
+  const metadata = join(directory, "metadata.out");
+  const manifest = join(directory, "manifest.json");
+  mkdirSync(directory, { mode: 0o700, recursive: true });
   rmSync(manifest, { force: true });
   const toolResult = spawnSync(
     "go",
@@ -305,25 +304,22 @@ export async function runGroup({ group, root, sha }) {
   );
 }
 
-export function mergeGroups({ directories, root, sha }) {
+export function mergeGroups({ directory, root, sha }) {
   checkContext(root, sha);
-  assert.equal(
-    directories.length,
-    groups.length,
-    "Every Go group is required.",
-  );
-  const reports = directories.map((directory) => {
+  const reports = groups.map((group) => {
+    const input = join(directory, group);
     const value = JSON.parse(
-      readFileSync(join(directory, manifestPath), "utf8"),
+      readFileSync(join(input, "manifest.json"), "utf8"),
     );
     assert.equal(value.version, 1);
+    assert.equal(value.group, group, "Go report group mismatch.");
     assert.equal(value.sha, sha, "Go report source SHA mismatch.");
     toolchain(value.tool);
     assert.deepEqual(value.parameters, parameters);
     const list = inventory(value.inventory);
     execution(list, selection(list, value.group), value.events);
-    const metadata = readFileSync(join(directory, metadataPath), "utf8");
-    const text = readFileSync(join(directory, profilePath), "utf8");
+    const metadata = readFileSync(join(input, "metadata.out"), "utf8");
+    const text = readFileSync(join(input, "coverage.out"), "utf8");
     assert.equal(
       digest(metadata),
       value.metadataSHA,
@@ -338,10 +334,6 @@ export function mergeGroups({ directories, root, sha }) {
     sameBlocks(profile(metadata), blocks);
     return { blocks, manifest: value };
   });
-  assert.deepEqual(
-    reports.map((report) => report.manifest.group).sort(),
-    groups,
-  );
   const first = reports[0];
   for (const report of reports.slice(1)) {
     assert.deepEqual(
@@ -368,7 +360,7 @@ export function mergeGroups({ directories, root, sha }) {
   const combined = "mode: atomic\n" + lines.join("\n") + "\n";
   writeReport(join(root, profilePath), combined);
   writeReport(
-    join(root, "coverage/go-tests/combined.json"),
+    join(root, reportsPath, "combined.json"),
     JSON.stringify({
       groups: reports.map((report) => report.manifest),
       profileSHA: digest(combined),
@@ -391,11 +383,7 @@ if (
       await runGroup({ group: process.argv[3], root, sha });
     else {
       assert.equal(process.argv[2], "merge");
-      mergeGroups({
-        directories: groups.map((group) => join(process.argv[3], group)),
-        root,
-        sha,
-      });
+      mergeGroups({ directory: process.argv[3], root, sha });
     }
   }
   main().catch((error) => {

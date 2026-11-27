@@ -22,7 +22,6 @@ export function assertCIResults(value) {
   for (const name of [
     "prepare",
     "web_tests",
-    "quality",
     "go_tests",
     "desktop_macos",
     "desktop_macos_go",
