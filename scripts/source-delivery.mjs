@@ -89,7 +89,22 @@ function backendRevision(sha) {
   throw new Error("Backend source history is missing.");
 }
 
-function backendRequired(sha, retry) {
+function backendChanged(from, to) {
+  return git(
+    "diff",
+    "--name-only",
+    "--no-renames",
+    "-z",
+    from,
+    to,
+    "--",
+    ...backendRoots,
+  )
+    .split("\0")
+    .some(backendPath);
+}
+
+function backendRequired(sha) {
   const deployments = api(
     `repos/${sourceRepository}/deployments?environment=production&per_page=100`,
     { paginate: true },
@@ -104,36 +119,18 @@ function backendRequired(sha, retry) {
     `repos/${sourceRepository}/deployments/${latest.id}/statuses?per_page=100`,
   );
   const success = states.sort((a, b) => b.id - a.id)[0]?.state === "success";
-  const changed = git(
-    "diff",
-    "--name-only",
-    "--no-renames",
-    "-z",
-    previous,
-    sha,
-  )
-    .split("\0")
-    .filter(Boolean)
-    .some(backendPath);
-  return changed || (!success && (retry || previous === sha));
+  return !success || backendChanged(previous, sha);
 }
 
-function tagSHA(tag, expected, skipIneligible = false) {
+function tagSHA(tag) {
   const ref = api(`repos/${sourceRepository}/git/ref/tags/${tag}`, {
     allowMissing: true,
   });
-  if (
-    !ref ||
-    ref.ref !== `refs/tags/${tag}` ||
-    ref.object?.type !== "commit" ||
-    (expected && ref.object.sha !== expected)
-  ) {
-    if (skipIneligible) return null;
+  if (!ref || ref.ref !== `refs/tags/${tag}` || ref.object?.type !== "commit") {
     throw new Error("Release reference does not match the source.");
   }
   const sha = checkedSHA(ref.object.sha);
   if (!sourceInMain(sha)) {
-    if (skipIneligible) return null;
     throw new Error("Source must be in main history.");
   }
   return sha;
@@ -162,57 +159,28 @@ function formalRelease(release, tag) {
   );
 }
 
-function releasePlan(tag, sha, retry, skipIneligible = false) {
-  if (!retry && latestSourceStatus(sha, "release/infra")) return null;
-  if (!tagSHA(tag, sha, skipIneligible)) return null;
-  const release = api(`repos/${sourceRepository}/releases/tags/${tag}`, {
-    allowMissing: true,
-  });
-  if (formalRelease(release, tag)) return null;
-  return {
-    sha,
-    tag,
-    release: true,
-    deploy: false,
-    deploy_sha: "",
-    existingRelease: release,
-  };
-}
-
-function pendingRelease() {
+function releasePlan(tag, retry) {
+  const sha = tagSHA(tag);
   const releases = api(`repos/${sourceRepository}/releases?per_page=100`, {
     paginate: true,
   }).flat();
-  const published = releases
-    .filter(
-      (value) =>
-        !value.draft &&
-        !value.prerelease &&
-        tagPattern.test(value.tag_name ?? ""),
-    )
-    .map((value) => value.tag_name)
-    .sort(compareTags)
-    .at(-1);
-  const tags = api(`repos/${sourceRepository}/tags?per_page=100`, {
-    paginate: true,
-  })
-    .flat()
-    .filter(
-      (value) =>
-        tagPattern.test(value.name ?? "") &&
-        (!published || compareTags(value.name, published) > 0),
-    )
-    .sort((a, b) => compareTags(a.name, b.name));
-  for (const tag of tags) {
-    const plan = releasePlan(
-      tag.name,
-      checkedSHA(tag.commit?.sha),
-      false,
-      true,
-    );
-    if (plan) return plan;
-  }
-  return null;
+  const existingRelease = releases.find((item) => item.tag_name === tag);
+  if (formalRelease(existingRelease, tag)) return null;
+  if (existingRelease)
+    throw new Error("Existing release cannot be resumed automatically.");
+  if (
+    releases.some(
+      (item) =>
+        !item.draft &&
+        !item.prerelease &&
+        tagPattern.test(item.tag_name ?? "") &&
+        compareTags(item.tag_name, tag) > 0,
+    ) ||
+    (!retry && latestSourceStatus(sha, "release/infra"))
+  )
+    return null;
+  verifyVersion(tag, sha);
+  return { sha, tag };
 }
 
 function stages(plan) {
@@ -228,11 +196,6 @@ function begin(plan) {
   status(plan.sha, "pending", deliveryContext);
   for (const stage of stages(plan)) status(stage.sha, "pending", stage.context);
   try {
-    if (plan.release) {
-      verifyVersion(plan.tag, plan.sha);
-      if (plan.existingRelease)
-        throw new Error("Existing release cannot be resumed automatically.");
-    }
     output({
       run: true,
       sha: plan.sha,
@@ -255,29 +218,29 @@ function prepare() {
     throw new Error("Source checkout is not the fixed clean commit.");
   requireSourceInMain(sha);
   const retry = process.env.RETRY_DELIVERY === "true";
-  let plan;
-  if (process.env.RELEASE_TAG)
-    plan = retry
-      ? releasePlan(process.env.RELEASE_TAG, sha, true)
-      : pendingRelease();
-  else {
-    if (backendRequired(sha, retry)) {
-      // 按真实后端变更去重，防止后续 Web/桌面提交重试已失败的后端阶段。
-      const checkpoint = backendRevision(sha);
-      if (retry || !latestSourceStatus(checkpoint, "deploy/infra"))
-        plan = {
-          sha,
-          tag: "",
-          release: false,
-          deploy: true,
-          deploy_sha: checkpoint,
-        };
+  const tag = process.env.RELEASE_TAG;
+  const release = tag ? releasePlan(tag, retry) : null;
+  const source = release?.sha ?? sha;
+  if (source !== sha) git("merge-base", "--is-ancestor", source, sha);
+  let checkpoint = "";
+  if (backendRequired(sha)) {
+    if (source !== sha && backendChanged(source, sha)) {
+      throw new Error("Release and main require different backend sources.");
     }
-    if (!plan && process.env.GITHUB_EVENT_NAME === "schedule")
-      plan = pendingRelease();
+    const revision = backendRevision(sha);
+    if (retry || !latestSourceStatus(revision, "deploy/infra"))
+      checkpoint = revision;
+    else if (release)
+      throw new Error("Required deployment needs an explicit retry.");
   }
-  if (plan) begin(plan);
-  else output({ run: false });
+  if (!checkpoint && !release) return output({ run: false });
+  begin({
+    sha: source,
+    tag: release?.tag ?? "",
+    release: Boolean(release),
+    deploy: Boolean(checkpoint),
+    deploy_sha: checkpoint,
+  });
 }
 
 function finish() {
@@ -302,16 +265,20 @@ function finish() {
     (stage) =>
       latestSourceStatus(stage.sha, stage.context)?.target_url === runURL(),
   );
-  const valid =
+  const backendOK =
     flags &&
     current &&
     results.prepare?.result === "success" &&
     results.ci?.result === "success" &&
-    results.release?.result === (release === "true" ? "success" : "skipped") &&
     results.deploy?.result === (deploy === "true" ? "success" : "skipped");
+  const valid =
+    backendOK &&
+    results.release?.result === (release === "true" ? "success" : "skipped");
   for (const stage of stages(plan)) {
-    if (latestSourceStatus(stage.sha, stage.context)?.target_url === runURL())
-      status(stage.sha, valid ? "success" : "failure", stage.context);
+    if (latestSourceStatus(stage.sha, stage.context)?.target_url === runURL()) {
+      const passed = stage.context === "deploy/infra" ? backendOK : valid;
+      status(stage.sha, passed ? "success" : "failure", stage.context);
+    }
   }
   status(sha, valid ? "success" : "failure", deliveryContext);
   if (!valid) throw new Error("Required delivery stages must succeed.");
@@ -322,19 +289,14 @@ function main(command) {
     process.env.GITHUB_REPOSITORY !== executionRepository ||
     process.env.GITHUB_REF !== "refs/heads/main" ||
     !process.env.GITHUB_OUTPUT ||
-    !["schedule", "workflow_dispatch"].includes(
-      process.env.GITHUB_EVENT_NAME,
-    ) ||
+    process.env.GITHUB_EVENT_NAME !== "workflow_dispatch" ||
     (process.env.RELEASE_TAG && !tagPattern.test(process.env.RELEASE_TAG))
   )
     throw new Error("Invalid delivery context.");
   assertPrivateSource();
   if (command === "snapshot")
     output({
-      sha:
-        process.env.RELEASE_TAG && process.env.RETRY_DELIVERY === "true"
-          ? tagSHA(process.env.RELEASE_TAG)
-          : checkedSHA(api(`repos/${sourceRepository}/commits/main`).sha),
+      sha: checkedSHA(api(`repos/${sourceRepository}/commits/main`).sha),
     });
   else if (command === "prepare") prepare();
   else if (command === "finish") finish();

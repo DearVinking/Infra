@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 留空检查或恢复 main 后端部署；指定已有版本 tag 发布或恢复应用
+        description: 总是检查 main 后端部署；填写版本 tag 时在同一次检查后发布应用
         required: false
         default: ""
         type: string
@@ -71,7 +71,6 @@ jobs:
         id: snapshot
         env:
           GH_TOKEN: ${{ secrets.CI_TOKEN }}
-          RETRY_DELIVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.retry }}
         run: node scripts/source-delivery.mjs snapshot
 
       - name: 检出触发判断所需历史
@@ -166,8 +165,8 @@ jobs:
       - name: 检查 Web 代码、类型、配置及依赖边界
         run: '"$QUIET" lint-web pnpm lint:web'
 
-      - name: 验证 Go 分组报告
-        run: '"$QUIET" go-report-test node --test "$GITHUB_WORKSPACE/tests/go-test-groups.test.mjs"'
+      - name: 验证交付规则与 Go 分组报告
+        run: '"$QUIET" infra-tests node --test "$GITHUB_WORKSPACE"/tests/*.test.mjs'
 
       - name: 生成 Web 覆盖率
         run: |
@@ -697,8 +696,12 @@ jobs:
 
   release:
     name: 验证并发布 macOS 产物
-    if: needs.prepare.outputs.release == 'true'
-    needs: [prepare, ci]
+    if: >-
+      ${{ !cancelled() && needs.prepare.result == 'success' && needs.ci.result == 'success' &&
+        needs.prepare.outputs.release == 'true' &&
+        ((needs.prepare.outputs.deploy == 'true' && needs.deploy.result == 'success') ||
+         (needs.prepare.outputs.deploy == 'false' && needs.deploy.result == 'skipped')) }}
+    needs: [prepare, ci, deploy]
     runs-on: macos-26
     timeout-minutes: 180
     environment: astrionyx-release
@@ -856,6 +859,7 @@ jobs:
           GH_TOKEN: ${{ secrets.CI_TOKEN }}
           ASTX_RELEASE_SETTINGS_TOKEN: ${{ secrets.DESKTOP_RELEASE_SETTINGS_TOKEN }}
         run: |
+          node "$GITHUB_WORKSPACE/scripts/source-ci.mjs" release-source
           "$QUIET" publish-release env \
             GITHUB_REPOSITORY="$SOURCE_REPOSITORY" \
             GITHUB_SHA="$SOURCE_SHA" GITHUB_REF_TYPE=tag \
